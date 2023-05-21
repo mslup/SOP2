@@ -2,8 +2,6 @@
 #ifndef _UTILS_H
 #define _UTILS_H
 
-// last updated: 3.04.2023 10:25
-
 /* =============================== Includes, defines, macros ============================== */ #pragma region
 
 #include <stdlib.h>
@@ -29,6 +27,7 @@
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#include <semaphore.h>
 
 #define ERR(source) (perror(source), /*kill(0, SIGKILL),*/           \
                      fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), \
@@ -59,7 +58,7 @@ typedef unsigned int uint;
 
 /* ======================================= General ======================================== */ #pragma region
 
-// Prints correct usage of the called program
+// Prints correct usage of the called program and exits
 void usage(char *prog_name)
 {
     fprintf(stderr, "Usage: %s ... \n", prog_name);
@@ -122,26 +121,10 @@ char randalpha()
 
 #pragma endregion
 
-/* ================================= L8 -- synchronization ================================ */ #pragma region
+/* =========================== L7, L8 -- sockets & synchronization ======================== */ #pragma region
+// `netstat -tulpn` to list processes occupying ports
 
-
-
-#pragma endregion
-
-/* ===================================== L7 -- sockets ==================================== */ #pragma region
-//https://gitlab.com/SaQQ/sop2/-/tree/main/04_net
 #define BACKLOG 3
-
-//int make_socket(char *name, struct sockaddr_un *addr)
-//{
-//    int socketfd;
-//    if ((socketfd = socket(PF_UNIX, SOCK_STREAM, 0)) < 0)
-//        ERR("socket");
-//    memset(addr, 0, sizeof(struct sockaddr_un));
-//    addr->sun_family = AF_UNIX;
-//    strncpy(addr->sun_path, name, sizeof(addr->sun_path) - 1);
-//    return socketfd;
-//}
 
 int make_socket(int domain, int type)
 {
@@ -151,6 +134,9 @@ int make_socket(int domain, int type)
         ERR("socket");
     return socketfd;
 }
+
+#define make_tcp_socket(void) make_socket(PF_INET, SOCK_STREAM)
+#define make_udp_socket(void) make_socket(PF_INET, SOCK_DGRAM)
 
 struct sockaddr_in make_address(char *address, char *port)
 {
@@ -166,6 +152,26 @@ struct sockaddr_in make_address(char *address, char *port)
     }
     addr = *(struct sockaddr_in *)(result->ai_addr);
     freeaddrinfo(result);
+    return addr;
+}
+
+// Error handling for `gethostbyname`
+#define HERR(source) (fprintf(stderr, "%s(%d) at %s:%d\n", \
+    source, h_errno, __FILE__, __LINE__), exit(EXIT_FAILURE))
+
+// I don't yet know what's the usage difference between this and the previous one
+// However use of `gethostbyname` is deprecated
+struct sockaddr_in make_haddress(char *address, uint16_t port)
+{
+    struct sockaddr_in addr;
+    struct hostent *hostinfo;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    hostinfo = gethostbyname(address);
+    if (hostinfo == NULL)
+        HERR("gethostbyname");
+
+    addr.sin_addr = *(struct in_addr *)hostinfo->h_addr;
     return addr;
 }
 
@@ -205,6 +211,23 @@ int bind_tcp_socket(uint16_t port)
     return socketfd;
 }
 
+int bind_udp_socket(uint16_t port)
+{
+    struct sockaddr_in addr;
+    int socketfd, t = 1;
+    socketfd = make_socket(PF_INET, SOCK_DGRAM);
+    memset(&addr, 0, sizeof(struct sockaddr_in));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, &t, sizeof(t)))
+        ERR("setsockopt");
+    if (bind(socketfd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+        ERR("bind");
+    return socketfd;
+}
+
+// Used in programs utilizing local and TCP connections.
 int add_new_client(int sfd)
 {
     int nfd;
@@ -217,17 +240,18 @@ int add_new_client(int sfd)
     return nfd;
 }
 
+// Used in programs utilizing local and TCP connections. (Since UDP is connectionless).
 int connect_socket(char *name, char *port)
 {
-    int socketfd = make_socket(PF_INET, SOCK_STREAM);
+    int socketfd = make_tcp_socket();
     struct sockaddr_in addr = make_address(name, port);
 
-    if (connect(socketfd, (struct sockaddr *)&addr, sizeof(struct sockaddr_in)/*SUN_LEN(&addr)*/) < 0)
+    if (connect(socketfd, (struct sockaddr *)&addr,
+                sizeof(struct sockaddr_in)) < 0)
     {
         if (errno != EINTR)
             ERR("connect");
 
-        // else
         fd_set write_fds;
         int status;
         socklen_t size = sizeof(int);
@@ -248,14 +272,55 @@ ssize_t bulk_read(int fd, char *buf, size_t count);
 
 ssize_t bulk_write(int fd, char *buf, size_t count);
 
-void calculate(int32_t data[5]);
+void do_server_example(int fd)
+{
+    int client_fd;
+    int16_t data; // change
+    ssize_t size;
 
+    fd_set base_read_fds, read_fds;
+    FD_ZERO(&base_read_fds);
+    FD_SET(fd, &base_read_fds);
+
+    sigset_t mask, oldmask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+
+    while (1) // change to allow proper SIGINT handling
+    {
+        read_fds = base_read_fds;
+        if (pselect(fd + 1, &read_fds,
+                    NULL, NULL, NULL, &oldmask) > 0)
+        {
+            if ((client_fd = add_new_client(fd)) >= 0)
+            {
+                if ((size = bulk_read(client_fd, (char *)&data, sizeof(data))) < 0)
+                    ERR("read");
+
+                if (size == (int)sizeof(data))
+                {
+                    // do something
+
+                    if (bulk_write(client_fd, (char *)&data, sizeof(data)) < 0)
+                        ERR("write");
+                }
+
+                CLOSE(client_fd);
+            }
+        } else
+        {
+            if (EINTR == errno)
+                continue;
+            ERR("pselect");
+        }
+    }
+    sigprocmask(SIG_UNBLOCK, &mask, NULL);
+}
 
 #pragma endregion
 
-/* ================================== L6 -- POSIX Queues ================================== */ #pragma region
-
-// TODO: Useful macro: write a set number of bytes to a constant size buffer and fill the rest with zeros.
+/* ================================== L6 -- POSIX queues ================================== */ #pragma region
 
 // Safe way of opening a message queue. Pass attr as a reference.
 #define MQ_OPEN(mqdes, name, attr)                                                              \
@@ -503,6 +568,18 @@ int millisleep(uint millisec)
     return safesleep(&req_time);
 }
 
+// Pass pointer to mutex
+#define LOCK_MUTEX(mutex)               \
+    if (pthread_mutex_lock(mutex) != 0) \
+        ERR("pthread_mutex_lock");      \
+    else
+
+// Pass pointer to mutex
+#define UNLOCK_MUTEX(mutex)                 \
+    if (pthread_mutex_unlock(mutex) != 0)   \
+        ERR("pthread_mutex_unlock");        \
+    else
+
 #pragma endregion
 
 /* ===================================== L2 -- signals ==================================== */ #pragma region
@@ -632,7 +709,7 @@ void check_remaing_children(int n)
 
 // Reads 'count' bytes from the file associated with the file descriptor 'fd'
 // into the buffer pointed to by 'buf', making sure the action isn't interrupted by an arrival of a signal.
-// L7: `fd` must be open in blocking mode. Otherwise function returns EAGAIN.
+// L7: `fd` must be open in blocking mode. Otherwise function returns with EAGAIN.
 // TODO: Make a version for non-blocking mode.
 ssize_t bulk_read(int fd, char *buf, size_t count)
 {
