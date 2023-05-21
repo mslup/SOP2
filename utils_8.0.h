@@ -122,28 +122,26 @@ char randalpha()
 
 #pragma endregion
 
-/* ================================= L8 -- synchronization ================================ */ #pragma region
-
-
-
-#pragma endregion
-
 /* ===================================== L7 -- sockets ==================================== */ #pragma region
 //https://gitlab.com/SaQQ/sop2/-/tree/main/04_net
+//https://sop.mini.pw.edu.pl/pl/sop2/wyk/w6/Inet_2_7.pdf
 #define BACKLOG 3
+#define MAXBUF 576
 
-//int make_socket(char *name, struct sockaddr_un *addr)
-//{
-//    int socketfd;
-//    if ((socketfd = socket(PF_UNIX, SOCK_STREAM, 0)) < 0)
-//        ERR("socket");
-//    memset(addr, 0, sizeof(struct sockaddr_un));
-//    addr->sun_family = AF_UNIX;
-//    strncpy(addr->sun_path, name, sizeof(addr->sun_path) - 1);
-//    return socketfd;
-//}
+// server-side
+int make_socket_server(char *name, struct sockaddr_un *addr)
+{
+    int socketfd;
+    if ((socketfd = socket(PF_UNIX, SOCK_STREAM, 0)) < 0)
+        ERR("socket");
+    memset(addr, 0, sizeof(struct sockaddr_un));
+    addr->sun_family = AF_UNIX;
+    strncpy(addr->sun_path, name, sizeof(addr->sun_path) - 1);
+    return socketfd;
+}
 
-int make_socket(int domain, int type)
+// client-side
+int make_socket_client(int domain, int type)
 {
     int socketfd;
     socketfd = socket(domain, type, 0);
@@ -152,6 +150,13 @@ int make_socket(int domain, int type)
     return socketfd;
 }
 
+// client-side
+int make_socket_client_udp(void)
+{
+    return make_socket_client(PF_INET, SOCK_DGRAM);
+}
+
+// used in connect_socket (client-side)
 struct sockaddr_in make_address(char *address, char *port)
 {
     int ret;
@@ -169,13 +174,14 @@ struct sockaddr_in make_address(char *address, char *port)
     return addr;
 }
 
+// server-side
 int bind_local_socket(char *name)
 {
     struct sockaddr_un addr;
     int socketfd;
     if (unlink(name) < 0 && errno != ENOENT)
         ERR("unlink");
-    socketfd = make_socket(PF_UNIX, SOCK_STREAM);
+    socketfd = make_socket_client(PF_UNIX, SOCK_STREAM);
     memset(&addr, 0, sizeof(struct sockaddr_un));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, name, sizeof(addr.sun_path) - 1);
@@ -186,11 +192,12 @@ int bind_local_socket(char *name)
     return socketfd;
 }
 
+// server-side
 int bind_tcp_socket(uint16_t port)
 {
     struct sockaddr_in addr;
     int socketfd, t = 1;
-    socketfd = make_socket(PF_INET, SOCK_STREAM);
+    socketfd = make_socket_client(PF_INET, SOCK_STREAM);
     memset(&addr, 0, sizeof(struct sockaddr_in));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -205,6 +212,27 @@ int bind_tcp_socket(uint16_t port)
     return socketfd;
 }
 
+// client-side
+int bind_inet_socket(uint16_t port, int type)
+{
+    struct sockaddr_in addr;
+    int socketfd, t = 1;
+    socketfd = make_socket_client(PF_INET, type);
+    memset(&addr, 0, sizeof(struct sockaddr_in));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, &t, sizeof(t)))
+        ERR("setsockopt");
+    if (bind(socketfd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+        ERR("bind");
+    if (SOCK_STREAM == type)
+        if (listen(socketfd, BACKLOG) < 0)
+            ERR("listen");
+    return socketfd;
+}
+
+// server-side
 int add_new_client(int sfd)
 {
     int nfd;
@@ -217,9 +245,38 @@ int add_new_client(int sfd)
     return nfd;
 }
 
-int connect_socket(char *name, char *port)
+// client-side
+int connect_socket_local(char *name)
 {
-    int socketfd = make_socket(PF_INET, SOCK_STREAM);
+    struct sockaddr_un addr;
+    int socketfd = make_socket_server(name, &addr);
+
+    if (connect(socketfd, (struct sockaddr *)&addr, SUN_LEN(&addr)) < 0)
+    {
+        if (errno != EINTR)
+            ERR("connect");
+
+        // else
+        fd_set write_fds;
+        int status;
+        socklen_t size = sizeof(int);
+        FD_ZERO(&write_fds);
+        FD_SET(socketfd, &write_fds);
+        if (TEMP_FAILURE_RETRY(select(socketfd + 1, NULL,
+                                      &write_fds, NULL, NULL)) < 0)
+            ERR("select");
+        if (getsockopt(socketfd, SOL_SOCKET, SO_ERROR, &status, &size) < 0)
+            ERR("getsockopt");
+        if (0 != status)
+            ERR("connect");
+    }
+    return socketfd;
+}
+
+// client-side
+int connect_socket_tcp(char *name, char *port)
+{
+    int socketfd = make_socket_client(PF_INET, SOCK_STREAM);
     struct sockaddr_in addr = make_address(name, port);
 
     if (connect(socketfd, (struct sockaddr *)&addr, sizeof(struct sockaddr_in)/*SUN_LEN(&addr)*/) < 0)
@@ -247,9 +304,6 @@ int connect_socket(char *name, char *port)
 ssize_t bulk_read(int fd, char *buf, size_t count);
 
 ssize_t bulk_write(int fd, char *buf, size_t count);
-
-void calculate(int32_t data[5]);
-
 
 #pragma endregion
 
